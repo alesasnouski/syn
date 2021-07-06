@@ -53,8 +53,9 @@ start() ->
         {ok, _} = syn_test_suite_helper:start_slave(
             maps:get(node, RemoteHost),
             maps:get(host, RemoteHost),
+            maps:get(ssh_port, RemoteHost, 22),
             maps:get(user, RemoteHost),
-            maps:get(pass, RemoteHost)
+            maps:get(pass, RemoteHost, [])
         )
     end, RemoteHosts),
 

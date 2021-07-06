@@ -27,9 +27,12 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/2]).
 -export([get_event_handler_module/0]).
 -export([get_anti_entropy_settings/1]).
+-export([ets_names/1]).
+-export([get_shard/1]).
+-export([get_ets/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -39,7 +42,7 @@
 -define(DEFAULT_ANTI_ENTROPY_MAX_DEVIATION_MS, 60000).
 
 %% records
--record(state, {}).
+-record(state, {worker_id :: atom(), id :: integer(), ets_names :: #{atom() => binary()}}).
 
 %% includes
 -include("syn.hrl").
@@ -47,10 +50,10 @@
 %% ===================================================================
 %% API
 %% ===================================================================
--spec start_link() -> {ok, pid()} | {error, any()}.
-start_link() ->
+-spec start_link(WorkerId :: atom(), Id :: integer()) -> {ok, pid()} | {error, any()}.
+start_link(WorkerId, Id) ->
     Options = [],
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], Options).
+    gen_server:start_link({local, WorkerId}, ?MODULE, {WorkerId, Id}, Options).
 
 -spec get_event_handler_module() -> module().
 get_event_handler_module() ->
@@ -91,6 +94,24 @@ get_anti_entropy_settings(Module) ->
             end
     end.
 
+ets_names(Id) ->
+    IdB = integer_to_binary(Id),
+    #{
+        syn_registry_by_name => binary_to_atom(<<"syn_registry_by_name_", IdB/binary>>, latin1),
+        syn_groups_by_name => binary_to_atom(<<"syn_groups_by_name_", IdB/binary>>, latin1)
+    }.
+
+
+get_shard(Key) ->
+    {ShardingMod, ShardingFun} = application:get_env(syn, sharding_fun, {erlang, phash2}),
+    SynShards = application:get_env(syn, syn_shards, 1),
+    erlang:apply(ShardingMod, ShardingFun, [Key, SynShards]) + 1.  % processes start from 1..
+
+
+get_ets(Key, Name) when is_atom(Name) ->
+    ShardId = get_shard(Key),
+    maps:get(Name, ets_names(ShardId)).
+
 %% ===================================================================
 %% Callbacks
 %% ===================================================================
@@ -98,23 +119,40 @@ get_anti_entropy_settings(Module) ->
 %% ----------------------------------------------------------------------------------------------------------
 %% Init
 %% ----------------------------------------------------------------------------------------------------------
--spec init([]) ->
+-spec init({WorkerId :: atom(), Id :: integer()}) ->
     {ok, #state{}} |
     {ok, #state{}, Timeout :: non_neg_integer()} |
     ignore |
     {stop, Reason :: any()}.
-init([]) ->
+init({WorkerId, Id}) ->
     %% create ETS tables
+    EtsNames = syn_backbone:ets_names(Id),
+    case Id == 0 of
+        true ->
+            %% entries have format {{Pid, Name}, Meta, Clock, MonitorRef, Node}
+            ets:new(
+                syn_registry_by_pid,
+                [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]
+            ),
+            %% entries have format {{Pid, GroupName}, Meta, MonitorRef, Node}
+            ets:new(
+                syn_groups_by_pid,
+                [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]
+            );
+        _ -> ok
+    end,
     %% entries have structure {{Name, Pid}, Meta, Clock, MonitorRef, Node}
-    ets:new(syn_registry_by_name, [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]),
-    %% entries have format {{Pid, Name}, Meta, Clock, MonitorRef, Node}
-    ets:new(syn_registry_by_pid, [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]),
+    ets:new(
+        maps:get(syn_registry_by_name, EtsNames),
+        [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]
+    ),
     %% entries have format {{GroupName, Pid}, Meta, MonitorRef, Node}
-    ets:new(syn_groups_by_name, [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]),
-    %% entries have format {{Pid, GroupName}, Meta, MonitorRef, Node}
-    ets:new(syn_groups_by_pid, [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]),
+    ets:new(
+        maps:get(syn_groups_by_name, EtsNames),
+        [ordered_set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]
+    ),
     %% init
-    {ok, #state{}}.
+    {ok, #state{worker_id = WorkerId, id = Id, ets_names = EtsNames}}.
 
 %% ----------------------------------------------------------------------------------------------------------
 %% Call messages
@@ -159,13 +197,11 @@ handle_info(Info, State) ->
 %% Terminate
 %% ----------------------------------------------------------------------------------------------------------
 -spec terminate(Reason :: any(), #state{}) -> terminated.
-terminate(Reason, _State) ->
+terminate(Reason, #state{ets_names = EtsNames}) ->
     error_logger:info_msg("Syn(~p): Terminating with reason: ~p~n", [node(), Reason]),
     %% delete ETS tables
-    ets:delete(syn_registry_by_name),
-    ets:delete(syn_registry_by_pid),
-    ets:delete(syn_groups_by_name),
-    ets:delete(syn_groups_by_pid),
+    ets:delete(maps:get(syn_registry_by_name, EtsNames)),
+    ets:delete(maps:get(syn_groups_by_name, EtsNames)),
     %% return
     terminated.
 

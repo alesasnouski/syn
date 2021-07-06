@@ -31,6 +31,7 @@
 
 %% Supervisor callbacks
 -export([init/1]).
+-export([get_process_name/2]).
 
 %% Helper macro for declaring children of supervisor
 -define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 10000, Type, [I]}).
@@ -49,9 +50,28 @@ start_link() ->
 -spec init([]) ->
     {ok, {{supervisor:strategy(), non_neg_integer(), pos_integer()}, [supervisor:child_spec()]}}.
 init([]) ->
-    Children = [
-        ?CHILD(syn_backbone, worker),
-        ?CHILD(syn_groups, worker),
-        ?CHILD(syn_registry, worker)
-    ],
+    SynInstances = application:get_env(syn, syn_shards, 1),
+    Children = [child_spec(syn_backbone, 0)] ++ lists:foldl(fun(I, Acc) ->  % TODO: do we need multiple syn_backbone processes here ?
+        [
+            child_spec(syn_backbone, I),
+            child_spec(syn_groups, I),
+            child_spec(syn_registry, I)
+        ] ++ Acc
+        end, [], lists:seq(1, SynInstances)
+    ),
     {ok, {{one_for_one, 10, 10}, Children}}.
+
+child_spec(Module, I) ->
+    ProcessName = get_process_name(Module, I),
+    #{
+        id => ProcessName,
+        start => {Module, start_link, [ProcessName, I]},
+        type => worker,
+        restart => permanent,
+        modules => [Module]
+    }.
+
+get_process_name(Module, Id) when is_atom(Module) andalso is_integer(Id) ->
+    IB = integer_to_binary(Id),
+    ModuleBin = atom_to_binary(Module, latin1),
+    binary_to_atom(<<ModuleBin/binary, "_", IB/binary>>, latin1).

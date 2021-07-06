@@ -27,7 +27,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/2]).
 -export([register/2, register/3]).
 -export([unregister_and_register/2, unregister_and_register/3]).
 -export([unregister/1]).
@@ -37,9 +37,9 @@
 %% sync API
 -export([sync_register/6, sync_unregister/3]).
 -export([sync_demonitor_and_kill_on_node/5]).
--export([sync_get_local_registry_tuples/1]).
+-export([sync_get_local_registry_tuples/2]).
 -export([force_cluster_sync/0]).
--export([add_to_local_table/5, remove_from_local_table/2]).
+-export([add_to_local_table/6, remove_from_local_table/3]).
 -export([find_monitor_for_pid/1]).
 
 %% internal
@@ -50,6 +50,8 @@
 
 %% records
 -record(state, {
+    process_name :: atom(),
+    syn_registry_by_name :: atom(),
     custom_event_handler :: undefined | module(),
     anti_entropy_interval_ms :: undefined | non_neg_integer(),
     anti_entropy_interval_max_deviation_ms :: undefined | non_neg_integer(),
@@ -62,10 +64,10 @@
 %% ===================================================================
 %% API
 %% ===================================================================
--spec start_link() -> {ok, pid()} | {error, any()}.
-start_link() ->
+-spec start_link(ProcessName :: atom(), Id :: integer()) -> {ok, pid()} | {error, any()}.
+start_link(ProcessName, Id) ->
     Options = [],
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], Options).
+    gen_server:start_link({local, ProcessName}, ?MODULE, {ProcessName, Id}, Options).
 
 -spec register(Name :: any(), Pid :: pid()) -> ok | {error, Reason :: any()}.
 register(Name, Pid) ->
@@ -74,7 +76,8 @@ register(Name, Pid) ->
 -spec register(Name :: any(), Pid :: pid(), Meta :: any()) -> ok | {error, Reason :: any()}.
 register(Name, Pid, Meta) when is_pid(Pid) ->
     Node = node(Pid),
-    gen_server:call({?MODULE, Node}, {register_on_node, Name, Pid, Meta, false}).
+    GenServerName = syn_sup:get_process_name(syn_registry, syn_backbone:get_shard(Name)),
+    gen_server:call({GenServerName, Node}, {register_on_node, Name, Pid, Meta, false}).
 
 -spec unregister_and_register(Name :: any(), Pid :: pid()) -> ok | {error, Reason :: any()}.
 unregister_and_register(Name, Pid) ->
@@ -83,44 +86,58 @@ unregister_and_register(Name, Pid) ->
 -spec unregister_and_register(Name :: any(), Pid :: pid(), Meta :: any()) -> ok | {error, Reason :: any()}.
 unregister_and_register(Name, Pid, Meta) when is_pid(Pid) ->
     Node = node(Pid),
-    gen_server:call({?MODULE, Node}, {register_on_node, Name, Pid, Meta, true}).
+    GenServerName = syn_sup:get_process_name(syn_registry, syn_backbone:get_shard(Name)),
+    gen_server:call({GenServerName, Node}, {register_on_node, Name, Pid, Meta, true}).
 
 -spec unregister(Name :: any()) -> ok | {error, Reason :: any()}.
 unregister(Name) ->
     % get process' node
-    case find_registry_tuple_by_name(Name) of
+    SynRegistryByName = syn_backbone:get_ets(Name, syn_registry_by_name),
+    case find_registry_tuple_by_name(Name, SynRegistryByName) of
         undefined ->
             {error, undefined};
         {Name, Pid, _, _} ->
             Node = node(Pid),
-            gen_server:call({?MODULE, Node}, {unregister_on_node, Name})
+            GenServerName = syn_sup:get_process_name(syn_registry, syn_backbone:get_shard(Name)),
+            gen_server:call({GenServerName, Node}, {unregister_on_node, Name})
     end.
 
 -spec whereis(Name :: any()) -> pid() | undefined.
 whereis(Name) ->
-    case find_registry_tuple_by_name(Name) of
+    SynRegistryByName = syn_backbone:get_ets(Name, syn_registry_by_name),
+    case find_registry_tuple_by_name(Name, SynRegistryByName) of
         undefined -> undefined;
         {Name, Pid, _, _} -> Pid
     end.
 
 -spec whereis(Name :: any(), with_meta) -> {pid(), Meta :: any()} | undefined.
 whereis(Name, with_meta) ->
-    case find_registry_tuple_by_name(Name) of
+    SynRegistryByName = syn_backbone:get_ets(Name, syn_registry_by_name),
+    case find_registry_tuple_by_name(Name, SynRegistryByName) of
         undefined -> undefined;
         {Name, Pid, Meta, _} -> {Pid, Meta}
     end.
 
 -spec count() -> non_neg_integer().
 count() ->
-    ets:info(syn_registry_by_name, size).
+    SynShards = application:get_env(syn, syn_shards, 1),
+    lists:foldl(fun(ShardId, Acc) ->
+        EtsName = maps:get(syn_registry_by_name, syn_backbone:ets_names(ShardId)),
+        ets:info(EtsName, size) + Acc
+    end, 0, lists:seq(1, SynShards)).
 
 -spec count(Node :: node()) -> non_neg_integer().
 count(Node) ->
-    ets:select_count(syn_registry_by_name, [{
-        {{'_', '_'}, '_', '_', '_', Node},
-        [],
-        [true]
-    }]).
+    SynShards = application:get_env(syn, syn_shards, 1),
+    lists:foldl(fun(ShardId, Acc) ->
+        EtsName = maps:get(syn_registry_by_name, syn_backbone:ets_names(ShardId)),
+        NodeSize = ets:select_count(EtsName, [{
+            {{'_', '_'}, '_', '_', '_', Node},
+            [],
+            [true]
+        }]),
+        NodeSize + Acc
+    end, 0, lists:seq(1, SynShards)).
 
 -spec sync_register(
     RemoteNode :: node(),
@@ -132,11 +149,13 @@ count(Node) ->
 ) ->
     ok.
 sync_register(RemoteNode, Name, RemotePid, RemoteMeta, RemoteTime, Force) ->
-    gen_server:cast({?MODULE, RemoteNode}, {sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}).
+    GenServerName = syn_sup:get_process_name(syn_registry, syn_backbone:get_shard(Name)),
+    gen_server:cast({GenServerName, RemoteNode}, {sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}).
 
 -spec sync_unregister(RemoteNode :: node(), Name :: any(), Pid :: pid()) -> ok.
 sync_unregister(RemoteNode, Name, Pid) ->
-    gen_server:cast({?MODULE, RemoteNode}, {sync_unregister, Name, Pid}).
+    GenServerName = syn_sup:get_process_name(syn_registry, syn_backbone:get_shard(Name)),
+    gen_server:cast({GenServerName, RemoteNode}, {sync_unregister, Name, Pid}).
 
 -spec sync_demonitor_and_kill_on_node(
     Name :: any(),
@@ -147,17 +166,32 @@ sync_unregister(RemoteNode, Name, Pid) ->
 ) -> ok.
 sync_demonitor_and_kill_on_node(Name, Pid, Meta, MonitorRef, Kill) ->
     RemoteNode = node(Pid),
-    gen_server:cast({?MODULE, RemoteNode}, {sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill}).
+    GenServerName = syn_sup:get_process_name(syn_registry, syn_backbone:get_shard(Name)),
+    gen_server:cast({GenServerName, RemoteNode}, {sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill}).
 
--spec sync_get_local_registry_tuples(FromNode :: node()) -> [syn_registry_tuple()].
-sync_get_local_registry_tuples(FromNode) ->
-    error_logger:info_msg("Syn(~p): Received request of local registry tuples from remote node ~p~n", [node(), FromNode]),
-    get_registry_tuples_for_node(node()).
+-spec sync_get_local_registry_tuples(FromNode :: node(), SynRegistryByName :: atom()) -> [syn_registry_tuple()].
+sync_get_local_registry_tuples(FromNode, SynRegistryByName) ->
+    error_logger:info_msg(
+        "Syn(~p): Received request of local registry tuples ~p from remote node ~p~n",
+        [node(), SynRegistryByName, FromNode]
+    ),
+    get_registry_tuples_for_node(node(), SynRegistryByName).
 
 -spec force_cluster_sync() -> ok.
 force_cluster_sync() ->
+    SynShards = application:get_env(syn, syn_shards, 1),
+    lists:foreach(
+        fun(Id) ->
+            ModuleName = syn_sup:get_process_name(syn_registry, Id),
+            do_force_cluster_sync(ModuleName)
+        end,
+        lists:seq(1, SynShards)
+    ).
+
+-spec do_force_cluster_sync(ModuleName :: atom()) -> ok.
+do_force_cluster_sync(ModuleName) ->
     lists:foreach(fun(RemoteNode) ->
-        gen_server:cast({?MODULE, RemoteNode}, force_cluster_sync)
+        gen_server:cast({ModuleName, RemoteNode}, force_cluster_sync)
     end, [node() | nodes()]).
 
 %% ===================================================================
@@ -167,16 +201,18 @@ force_cluster_sync() ->
 %% ----------------------------------------------------------------------------------------------------------
 %% Init
 %% ----------------------------------------------------------------------------------------------------------
--spec init([]) ->
+-spec init({ProcessName :: atom(), Id :: integer()}) ->
     {ok, #state{}} |
     {ok, #state{}, Timeout :: non_neg_integer()} |
     ignore |
     {stop, Reason :: any()}.
-init([]) ->
+init({ProcessName, Id}) ->
+    EtsTables = syn_backbone:ets_names(Id),
+    SynRegistryByName = maps:get(syn_registry_by_name, EtsTables),
     %% monitor nodes
     ok = net_kernel:monitor_nodes(true),
     %% rebuild monitors (if coming after a crash)
-    rebuild_monitors(),
+    rebuild_monitors(SynRegistryByName),
     %% start multicast process
     MulticastPid = spawn_link(?MODULE, multicast_loop, []),
     %% get handler
@@ -185,6 +221,8 @@ init([]) ->
     {AntiEntropyIntervalMs, AntiEntropyIntervalMaxDeviationMs} = syn_backbone:get_anti_entropy_settings(registry),
     %% build state
     State = #state{
+        process_name = ProcessName,
+        syn_registry_by_name = SynRegistryByName,
         custom_event_handler = CustomEventHandler,
         anti_entropy_interval_ms = AntiEntropyIntervalMs,
         anti_entropy_interval_max_deviation_ms = AntiEntropyIntervalMaxDeviationMs,
@@ -208,15 +246,15 @@ init([]) ->
     {stop, Reason :: any(), Reply :: any(), #state{}} |
     {stop, Reason :: any(), #state{}}.
 
-handle_call({register_on_node, Name, Pid, Meta, Force}, _From, State) ->
+handle_call({register_on_node, Name, Pid, Meta, Force}, _From, #state{syn_registry_by_name = SynRegistryByName} = State) ->
     %% check if pid is alive
     case is_process_alive(Pid) of
         true ->
             %% check if name available
-            case find_registry_tuple_by_name(Name) of
+            case find_registry_tuple_by_name(Name, SynRegistryByName) of
                 undefined ->
                     %% available
-                    {ok, Time} = register_on_node(Name, Pid, Meta),
+                    {ok, Time} = register_on_node(Name, Pid, Meta, SynRegistryByName),
                     %% multicast
                     multicast_register(Name, Pid, Meta, Time, false, State),
                     %% return
@@ -224,7 +262,7 @@ handle_call({register_on_node, Name, Pid, Meta, Force}, _From, State) ->
 
                 {Name, Pid, _, _} ->
                     % same pid, overwrite
-                    {ok, Time} = register_on_node(Name, Pid, Meta),
+                    {ok, Time} = register_on_node(Name, Pid, Meta, SynRegistryByName),
                     %% multicast
                     multicast_register(Name, Pid, Meta, Time, false, State),
                     %% return
@@ -236,7 +274,7 @@ handle_call({register_on_node, Name, Pid, Meta, Force}, _From, State) ->
                         true ->
                             demonitor_if_local(TablePid),
                             %% force register
-                            {ok, Time} = register_on_node(Name, Pid, Meta),
+                            {ok, Time} = register_on_node(Name, Pid, Meta, SynRegistryByName),
                             %% multicast
                             multicast_register(Name, Pid, Meta, Time, true, State),
                             %% return
@@ -250,8 +288,8 @@ handle_call({register_on_node, Name, Pid, Meta, Force}, _From, State) ->
             {reply, {error, not_alive}, State}
     end;
 
-handle_call({unregister_on_node, Name}, _From, State) ->
-    case unregister_on_node(Name) of
+handle_call({unregister_on_node, Name}, _From, #state{syn_registry_by_name = SynRegistryByName} = State) ->
+    case unregister_on_node(Name, SynRegistryByName) of
         {ok, RemovedPid} ->
             multicast_unregister(Name, RemovedPid, State),
             %% return
@@ -261,8 +299,11 @@ handle_call({unregister_on_node, Name}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
-handle_call(Request, From, State) ->
-    error_logger:warning_msg("Syn(~p): Received from ~p an unknown call message: ~p~n", [node(), Request, From]),
+handle_call(Request, From, #state{process_name = ProcName} = State) ->
+    error_logger:warning_msg(
+        "Syn(~p ~p): Received from ~p an unknown call message: ~p~n",
+        [node(), ProcName, Request, From]
+    ),
     {reply, undefined, State}.
 
 %% ----------------------------------------------------------------------------------------------------------
@@ -273,29 +314,34 @@ handle_call(Request, From, State) ->
     {noreply, #state{}, Timeout :: non_neg_integer()} |
     {stop, Reason :: any(), #state{}}.
 
-handle_cast({sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}, State) ->
+handle_cast({sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force},
+    #state{syn_registry_by_name = SynRegistryByName, process_name = ProcessName} = State) ->
     %% check for conflicts
-    case find_registry_tuple_by_name(Name) of
+    case find_registry_tuple_by_name(Name, SynRegistryByName) of
         undefined ->
             %% no conflict
-            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined);
+            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined, SynRegistryByName);
 
         {Name, RemotePid, _, _} ->
             %% same process, no conflict, overwrite
-            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined);
+            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined, SynRegistryByName);
 
         {Name, TablePid, _, _} when Force =:= true ->
             demonitor_if_local(TablePid),
             %% overwrite
-            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined);
+            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined, SynRegistryByName);
 
         {Name, TablePid, TableMeta, TableTime} when Force =:= false ->
             %% different pid, we have a conflict
-            global:trans({{?MODULE, {inconsistent_name, Name}}, self()},
+            global:trans({{ProcessName, {inconsistent_name, Name}}, self()},
                 fun() ->
                     error_logger:warning_msg(
-                        "Syn(~p): REGISTRY INCONSISTENCY (name: ~p for ~p and ~p) ----> Received from remote node ~p~n",
-                        [node(), Name, {TablePid, TableMeta, TableTime}, {RemotePid, RemoteMeta, RemoteTime}, node(RemotePid)]
+                        "Syn(~p ~p): REGISTRY INCONSISTENCY (name: ~p for ~p and ~p) ----> Received from remote node ~p~n",
+                        [node(), ProcessName, Name,
+                            {TablePid, TableMeta, TableTime},
+                            {RemotePid, RemoteMeta, RemoteTime},
+                            node(RemotePid)
+                        ]
                     ),
 
                     case resolve_conflict(Name, {TablePid, TableMeta, TableTime}, {RemotePid, RemoteMeta, RemoteTime}, State) of
@@ -336,8 +382,8 @@ handle_cast({sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}, Sta
                     end,
 
                     error_logger:info_msg(
-                        "Syn(~p): REGISTRY INCONSISTENCY (name: ~p)  <---- Done on all cluster~n",
-                        [node(), Name]
+                        "Syn(~p ~p): REGISTRY INCONSISTENCY (name: ~p)  <---- Done on all cluster~n",
+                        [node(), ProcessName, Name]
                     )
                 end
             )
@@ -345,19 +391,25 @@ handle_cast({sync_register, Name, RemotePid, RemoteMeta, RemoteTime, Force}, Sta
     %% return
     {noreply, State};
 
-handle_cast({sync_unregister, Name, Pid}, State) ->
+handle_cast({sync_unregister, Name, Pid}, #state{syn_registry_by_name = SynRegistryByName} = State) ->
     %% remove
-    remove_from_local_table(Name, Pid),
+    remove_from_local_table(Name, Pid, SynRegistryByName),
     %% return
     {noreply, State};
 
-handle_cast(force_cluster_sync, State) ->
-    error_logger:info_msg("Syn(~p): Initiating full cluster FORCED registry sync for nodes: ~p~n", [node(), nodes()]),
+handle_cast(force_cluster_sync, #state{process_name = ProcessName} = State) ->
+    error_logger:info_msg(
+        "Syn(~p ~p): Initiating full cluster FORCED registry sync for nodes: ~p~n",
+        [node(), ProcessName, nodes()]
+    ),
     do_sync_from_full_cluster(State),
     {noreply, State};
 
-handle_cast({sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill}, State) ->
-    error_logger:info_msg("Syn(~p): Sync demonitoring pid ~p~n", [node(), Pid]),
+handle_cast(
+    {sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill},
+    #state{process_name = ProcessName} = State
+) ->
+    error_logger:info_msg("Syn(~p ~p): Sync ~p demonitoring pid ~p~n", [node(), ProcessName, Pid]),
     %% demonitor
     catch erlang:demonitor(MonitorRef, [flush]),
     %% kill
@@ -370,8 +422,8 @@ handle_cast({sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill}
     end,
     {noreply, State};
 
-handle_cast(Msg, State) ->
-    error_logger:warning_msg("Syn(~p): Received an unknown cast message: ~p~n", [node(), Msg]),
+handle_cast(Msg, #state{process_name = ProcessName} = State) ->
+    error_logger:warning_msg("Syn(~p ~p): Received an unknown cast message: ~p~n", [node(), ProcessName, Msg]),
     {noreply, State}.
 
 %% ----------------------------------------------------------------------------------------------------------
@@ -382,7 +434,7 @@ handle_cast(Msg, State) ->
     {noreply, #state{}, Timeout :: non_neg_integer()} |
     {stop, Reason :: any(), #state{}}.
 
-handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
+handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, #state{syn_registry_by_name = SynRegistryByName} = State) ->
     case find_registry_tuples_by_pid(Pid) of
         [] ->
             %% handle
@@ -393,7 +445,7 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
                 %% handle
                 handle_process_down(Name, Pid, Meta, Reason, State),
                 %% remove from table
-                remove_from_local_table(Name, Pid),
+                remove_from_local_table(Name, Pid, SynRegistryByName),
                 %% multicast
                 multicast_unregister(Name, Pid, State)
             end, Entries)
@@ -401,29 +453,41 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
     %% return
     {noreply, State};
 
-handle_info({nodeup, RemoteNode}, State) ->
-    error_logger:info_msg("Syn(~p): Node ~p has joined the cluster~n", [node(), RemoteNode]),
+handle_info({nodeup, RemoteNode}, #state{syn_registry_by_name = SynRegistryByName, process_name = ProcName} = State) ->
+    error_logger:info_msg(
+        "Syn(~p ~p): Node has joined the cluster ~p~n",
+        [node(), ProcName, RemoteNode, SynRegistryByName]
+    ),
     registry_automerge(RemoteNode, State),
     %% resume
     {noreply, State};
 
-handle_info({nodedown, RemoteNode}, State) ->
-    error_logger:warning_msg("Syn(~p): Node ~p has left the cluster, removing registry entries on local~n", [node(), RemoteNode]),
-    raw_purge_registry_entries_for_remote_node(RemoteNode),
+handle_info({nodedown, RemoteNode}, #state{syn_registry_by_name = SynRegistryByName, process_name = ProcName} = State) ->
+    error_logger:warning_msg(
+        "Syn(~p ~p): Node has left the cluster ~p, removing registry entries on local~n",
+        [node(), ProcName, RemoteNode]
+    ),
+    raw_purge_registry_entries_for_remote_node(RemoteNode, SynRegistryByName),
     {noreply, State};
 
-handle_info(sync_from_full_cluster, State) ->
-    error_logger:info_msg("Syn(~p): Initiating full cluster registry sync for nodes: ~p~n", [node(), nodes()]),
+handle_info(sync_from_full_cluster, #state{process_name = ProcName} = State) ->
+    error_logger:info_msg(
+        "Syn(~p ~p): Initiating full cluster registry sync for nodes: ~p~n",
+        [node(), ProcName, nodes()]
+    ),
     do_sync_from_full_cluster(State),
     {noreply, State};
 
-handle_info(sync_anti_entropy, State) ->
+handle_info(sync_anti_entropy, #state{syn_registry_by_name = SynRegistryByName, process_name = ProcName} = State) ->
     %% sync
     RemoteNodes = nodes(),
     case length(RemoteNodes) > 0 of
         true ->
             RandomRemoteNode = lists:nth(rand:uniform(length(RemoteNodes)), RemoteNodes),
-            error_logger:info_msg("Syn(~p): Initiating anti-entropy sync for node ~p~n", [node(), RandomRemoteNode]),
+            error_logger:info_msg(
+                "Syn(~p ~p): Initiating anti-entropy sync for node ~p ~p~n",
+                [node(), ProcName, RandomRemoteNode, SynRegistryByName]
+            ),
             registry_automerge(RandomRemoteNode, State);
 
         _ ->
@@ -434,8 +498,8 @@ handle_info(sync_anti_entropy, State) ->
     %% return
     {noreply, State};
 
-handle_info(Info, State) ->
-    error_logger:warning_msg("Syn(~p): Received an unknown info message: ~p~n", [node(), Info]),
+handle_info(Info, #state{process_name = ProcName} = State) ->
+    error_logger:warning_msg("Syn(~p ~p) ~p: Received an unknown info message: ~p~n", [node(), ProcName, Info]),
     {noreply, State}.
 
 %% ----------------------------------------------------------------------------------------------------------
@@ -443,9 +507,10 @@ handle_info(Info, State) ->
 %% ----------------------------------------------------------------------------------------------------------
 -spec terminate(Reason :: any(), #state{}) -> terminated.
 terminate(Reason, #state{
-    multicast_pid = MulticastPid
+    multicast_pid = MulticastPid,
+    process_name = ProcName
 }) ->
-    error_logger:info_msg("Syn(~p): Terminating with reason: ~p~n", [node(), Reason]),
+    error_logger:info_msg("Syn(~p ~p) : Terminating with reason: ~p~n", [node(), ProcName, Reason]),
     MulticastPid ! terminate,
     terminated.
 
@@ -478,8 +543,9 @@ multicast_unregister(Name, Pid, #state{
 }) ->
     MulticastPid ! {multicast_unregister, Name, Pid}.
 
--spec register_on_node(Name :: any(), Pid :: pid(), Meta :: any()) -> {ok, Time :: integer()}.
-register_on_node(Name, Pid, Meta) ->
+-spec register_on_node(Name :: any(), Pid :: pid(), Meta :: any(), SynRegistryByName :: atom()) ->
+    {ok, Time :: integer()}.
+register_on_node(Name, Pid, Meta, SynRegistryByName) ->
     MonitorRef = case find_monitor_for_pid(Pid) of
         undefined ->
             %% process is not monitored yet, add
@@ -490,12 +556,13 @@ register_on_node(Name, Pid, Meta) ->
     end,
     %% add to table
     Time = erlang:system_time(),
-    add_to_local_table(Name, Pid, Meta, Time, MonitorRef),
+    add_to_local_table(Name, Pid, Meta, Time, MonitorRef, SynRegistryByName),
     {ok, Time}.
 
--spec unregister_on_node(Name :: any()) -> {ok, RemovedPid :: pid()} | {error, Reason :: any()}.
-unregister_on_node(Name) ->
-    case find_registry_entry_by_name(Name) of
+-spec unregister_on_node(Name :: any(), SynRegistryByName :: atom()) ->
+    {ok, RemovedPid :: pid()} | {error, Reason :: any()}.
+unregister_on_node(Name, SynRegistryByName) ->
+    case find_registry_entry_by_name(Name, SynRegistryByName) of
         undefined ->
             {error, undefined};
 
@@ -503,17 +570,17 @@ unregister_on_node(Name) ->
             %% demonitor if the process is not registered under other names
             maybe_demonitor(Pid),
             %% remove from table
-            remove_from_local_table(Name, Pid),
+            remove_from_local_table(Name, Pid, SynRegistryByName),
             %% return
             {ok, Pid};
 
         {{Name, Pid}, _Meta, _Clock, _MonitorRef, Node} = RegistryEntry when Node =:= node() ->
             error_logger:error_msg(
-                "Syn(~p): INTERNAL ERROR | Registry entry ~p has no monitor but it's running on node~n",
-                [node(), RegistryEntry]
+                "Syn(~p): INTERNAL ERROR | Registry ~p entry ~p has no monitor but it's running on node~n",
+                [node(), SynRegistryByName, RegistryEntry]
             ),
             %% remove from table
-            remove_from_local_table(Name, Pid),
+            remove_from_local_table(Name, Pid, SynRegistryByName),
             %% return
             {ok, Pid};
 
@@ -521,8 +588,8 @@ unregister_on_node(Name) ->
             %% race condition: un-registration request but entry in table is not a local pid (has no monitor)
             %% sync messages will take care of it
             error_logger:info_msg(
-                "Syn(~p): Registry entry ~p is not monitored and it's not running on node~n",
-                [node(), RegistryEntry]
+                "Syn(~p): Registry ~p entry ~p is not monitored and it's not running on node~n",
+                [node(), SynRegistryByName, RegistryEntry]
             ),
             {error, remote_pid}
     end.
@@ -549,31 +616,33 @@ maybe_demonitor(Pid) ->
     Pid :: pid(),
     Meta :: any(),
     Time :: integer(),
-    MonitorRef :: undefined | reference()
+    MonitorRef :: undefined | reference(),
+    SynRegistryByName :: atom()
 ) -> ok.
-add_to_local_table(Name, Pid, Meta, Time, MonitorRef) ->
+add_to_local_table(Name, Pid, Meta, Time, MonitorRef, SynRegistryByName) ->
     %% remove entry if previous exists
-    case find_registry_tuple_by_name(Name) of
+    case find_registry_tuple_by_name(Name, SynRegistryByName) of
         undefined ->
             undefined;
 
         {Name, PreviousPid, _, _} ->
-            remove_from_local_table(Name, PreviousPid)
+            remove_from_local_table(Name, PreviousPid, SynRegistryByName)
     end,
     %% overwrite & add
-    ets:insert(syn_registry_by_name, {{Name, Pid}, Meta, Time, MonitorRef, node(Pid)}),
+    ets:insert(SynRegistryByName, {{Name, Pid}, Meta, Time, MonitorRef, node(Pid)}),
     ets:insert(syn_registry_by_pid, {{Pid, Name}, Meta, Time, MonitorRef, node(Pid)}),
     ok.
 
--spec remove_from_local_table(Name :: any(), Pid :: pid()) -> ok.
-remove_from_local_table(Name, Pid) ->
-    ets:delete(syn_registry_by_name, {Name, Pid}),
+-spec remove_from_local_table(Name :: any(), Pid :: pid(), SynRegistryByName :: atom()) -> ok.
+remove_from_local_table(Name, Pid, SynRegistryByName) ->
+    ets:delete(SynRegistryByName, {Name, Pid}),
     ets:delete(syn_registry_by_pid, {Pid, Name}),
     ok.
 
--spec find_registry_tuple_by_name(Name :: any()) -> RegistryTuple :: syn_registry_tuple() | undefined.
-find_registry_tuple_by_name(Name) ->
-    case ets:select(syn_registry_by_name, [{
+-spec find_registry_tuple_by_name(Name :: any(), SynRegistryByName :: atom()) ->
+    RegistryTuple :: syn_registry_tuple() | undefined.
+find_registry_tuple_by_name(Name, SynRegistryByName) ->
+    case ets:select(SynRegistryByName, [{
         {{Name, '$2'}, '$3', '$4', '_', '_'},
         [],
         [{{{const, Name}, '$2', '$3', '$4'}}]
@@ -582,9 +651,10 @@ find_registry_tuple_by_name(Name) ->
         _ -> undefined
     end.
 
--spec find_registry_entry_by_name(Name :: any()) -> Entry :: syn_registry_entry() | undefined.
-find_registry_entry_by_name(Name) ->
-    case ets:select(syn_registry_by_name, [{
+-spec find_registry_entry_by_name(Name :: any(), SynRegistryByName :: atom()) ->
+    Entry :: syn_registry_entry() | undefined.
+find_registry_entry_by_name(Name, SynRegistryByName) ->
+    case ets:select(SynRegistryByName, [{
         {{Name, '$2'}, '$3', '_', '_', '_'},
         [],
         ['$_']
@@ -612,9 +682,9 @@ find_registry_tuples_by_pid(Pid) when is_pid(Pid) ->
         [{{'$2', Pid, '$3', '$4'}}]
     }]).
 
--spec get_registry_tuples_for_node(Node :: node()) -> [syn_registry_tuple()].
-get_registry_tuples_for_node(Node) ->
-    ets:select(syn_registry_by_name, [{
+-spec get_registry_tuples_for_node(Node :: node(), SynRegistryByName :: atom()) -> [syn_registry_tuple()].
+get_registry_tuples_for_node(Node, SynRegistryByName) ->
+    ets:select(SynRegistryByName, [{
         {{'$1', '$2'}, '$3', '$4', '_', Node},
         [],
         [{{'$1', '$2', '$3', '$4'}}]
@@ -622,7 +692,8 @@ get_registry_tuples_for_node(Node) ->
 
 -spec handle_process_down(Name :: any(), Pid :: pid(), Meta :: any(), Reason :: any(), #state{}) -> ok.
 handle_process_down(Name, Pid, Meta, Reason, #state{
-    custom_event_handler = CustomEventHandler
+    custom_event_handler = CustomEventHandler,
+    process_name = ProcName
 }) ->
     case Name of
         undefined ->
@@ -632,8 +703,8 @@ handle_process_down(Name, Pid, Meta, Reason, #state{
 
                 _ ->
                     error_logger:warning_msg(
-                        "Syn(~p): Received a DOWN message from an unregistered process ~p with reason: ~p~n",
-                        [node(), Pid, Reason]
+                        "Syn(~p ~p): Received a DOWN message from an unregistered process ~p with reason: ~p~n",
+                        [node(), ProcName, Pid, Reason]
                     )
             end;
 
@@ -642,25 +713,31 @@ handle_process_down(Name, Pid, Meta, Reason, #state{
     end.
 
 -spec registry_automerge(RemoteNode :: node(), #state{}) -> ok.
-registry_automerge(RemoteNode, State) ->
-    global:trans({{?MODULE, auto_merge_registry}, self()},
+registry_automerge(RemoteNode, #state{
+    process_name = ProcessName,
+    syn_registry_by_name = SynRegistryByName
+} = State) ->
+    global:trans({{ProcessName, auto_merge_registry}, self()},
         fun() ->
-            error_logger:info_msg("Syn(~p): REGISTRY AUTOMERGE ----> Initiating for remote node ~p~n", [node(), RemoteNode]),
+            error_logger:info_msg(
+                "Syn(~p ~p): REGISTRY AUTOMERGE ----> Initiating for remote node ~p~n",
+                [node(), ProcessName, RemoteNode]
+            ),
             %% get registry tuples from remote node
-            case rpc:call(RemoteNode, ?MODULE, sync_get_local_registry_tuples, [node()]) of
+            case rpc:call(RemoteNode, ProcessName, sync_get_local_registry_tuples, [node(), SynRegistryByName]) of
                 {badrpc, _} ->
                     error_logger:info_msg(
-                        "Syn(~p): REGISTRY AUTOMERGE <---- Syn not ready on remote node ~p, postponing~n",
-                        [node(), RemoteNode]
+                        "Syn(~p ~p): REGISTRY AUTOMERGE <---- Syn not ready on remote node ~p, postponing~n",
+                        [node(), ProcessName, RemoteNode]
                     );
 
                 RegistryTuples ->
                     error_logger:info_msg(
-                        "Syn(~p): Received ~p registry tuple(s) from remote node ~p~n",
-                        [node(), length(RegistryTuples), RemoteNode]
+                        "Syn(~p ~p): Received ~p registry tuple(s) from remote node ~p~n",
+                        [node(), ProcessName, length(RegistryTuples), RemoteNode]
                     ),
                     %% ensure that registry doesn't have any joining node's entries (here again for race conditions)
-                    raw_purge_registry_entries_for_remote_node(RemoteNode),
+                    raw_purge_registry_entries_for_remote_node(RemoteNode, SynRegistryByName),
                     %% loop
                     F = fun({Name, RemotePid, RemoteMeta, RemoteTime}) ->
                         resolve_tuple_in_automerge(Name, RemotePid, RemoteMeta, RemoteTime, State)
@@ -668,7 +745,10 @@ registry_automerge(RemoteNode, State) ->
                     %% add to table
                     lists:foreach(F, RegistryTuples),
                     %% exit
-                    error_logger:info_msg("Syn(~p): REGISTRY AUTOMERGE <---- Done for remote node ~p~n", [node(), RemoteNode])
+                    error_logger:info_msg(
+                        "Syn(~p ~p): REGISTRY AUTOMERGE <---- Done for remote node ~p~n",
+                        [node(), ProcessName, RemoteNode]
+                    )
             end
         end
     ).
@@ -680,17 +760,20 @@ registry_automerge(RemoteNode, State) ->
     RemoteTime :: integer(),
     #state{}
 ) -> any().
-resolve_tuple_in_automerge(Name, RemotePid, RemoteMeta, RemoteTime, State) ->
+resolve_tuple_in_automerge(
+    Name, RemotePid, RemoteMeta, RemoteTime,
+    #state{syn_registry_by_name = SynRegistryByName, process_name = ProcessName} = State
+) ->
     %% check if same name is registered
-    case find_registry_tuple_by_name(Name) of
+    case find_registry_tuple_by_name(Name, SynRegistryByName) of
         undefined ->
             %% no conflict
-            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined);
+            add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined, SynRegistryByName);
 
         {Name, TablePid, TableMeta, TableTime} ->
             error_logger:warning_msg(
-                "Syn(~p): Conflicting name in auto merge for: ~p, processes are ~p, ~p~n",
-                [node(), Name, {TablePid, TableMeta, TableTime}, {RemotePid, RemoteMeta, RemoteTime}]
+                "Syn(~p ~p): Conflicting name in auto merge for: ~p, processes are ~p, ~p~n",
+                [node(), ProcessName, Name, {TablePid, TableMeta, TableTime}, {RemotePid, RemoteMeta, RemoteTime}]
             ),
 
             case resolve_conflict(Name, {TablePid, TableMeta, TableTime}, {RemotePid, RemoteMeta, RemoteTime}, State) of
@@ -708,11 +791,11 @@ resolve_tuple_in_automerge(Name, RemotePid, RemoteMeta, RemoteTime, State) ->
                     MonitorRef = rpc:call(node(TablePid), syn_registry, find_monitor_for_pid, [TablePid]),
                     sync_demonitor_and_kill_on_node(Name, TablePid, TableMeta, MonitorRef, KillOtherPid),
                     %% overwrite remote data to local
-                    add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined);
+                    add_to_local_table(Name, RemotePid, RemoteMeta, RemoteTime, undefined, SynRegistryByName);
 
                 undefined ->
                     %% both are dead, remove from local & remote
-                    remove_from_local_table(Name, TablePid),
+                    remove_from_local_table(Name, TablePid, SynRegistryByName),
                     ok = rpc:call(node(RemotePid), syn_registry, remove_from_local_table, [Name, RemotePid])
             end
     end.
@@ -727,7 +810,7 @@ resolve_conflict(
     Name,
     {TablePid, TableMeta, TableTime},
     {RemotePid, RemoteMeta, RemoteTime},
-    #state{custom_event_handler = CustomEventHandler}
+    #state{custom_event_handler = CustomEventHandler, process_name = ProcName}
 ) ->
     TablePidAlive = rpc:call(node(TablePid), erlang, is_process_alive, [TablePid]),
     RemotePidAlive = rpc:call(node(RemotePid), erlang, is_process_alive, [RemotePid]),
@@ -761,30 +844,30 @@ resolve_conflict(
         TablePid ->
             %% keep local
             error_logger:info_msg(
-                "Syn(~p): Keeping process in table ~p over remote process ~p~n",
-                [node(), TablePid, RemotePid]
+                "Syn(~p ~p): Keeping process in table ~p over remote process ~p~n",
+                [node(), ProcName, TablePid, RemotePid]
             ),
             {TablePid, KillOtherPid};
 
         RemotePid ->
             %% keep remote
             error_logger:info_msg(
-                "Syn(~p): Keeping remote process ~p over process in table ~p~n",
-                [node(), RemotePid, TablePid]
+                "Syn(~p ~p): Keeping remote process ~p over process in table ~p~n",
+                [node(), ProcName, RemotePid, TablePid]
             ),
             {RemotePid, KillOtherPid};
 
         undefined ->
             error_logger:info_msg(
-                "Syn(~p): Removing both processes' ~p and ~p data from local and remote tables~n",
-                [node(), RemotePid, TablePid]
+                "Syn(~p ~p): Removing both processes' ~p and ~p data from local and remote tables~n",
+                [node(), ProcName, RemotePid, TablePid]
             ),
             undefined;
 
         Other ->
             error_logger:error_msg(
-                "Syn(~p): Custom handler returned ~p, valid options were ~p and ~p, removing both~n",
-                [node(), Other, TablePid, RemotePid]
+                "Syn(~p ~p): Custom handler returned ~p, valid options were ~p and ~p, removing both~n",
+                [node(), ProcName, Other, TablePid, RemotePid]
             ),
             undefined
     end.
@@ -795,24 +878,24 @@ do_sync_from_full_cluster(State) ->
         registry_automerge(RemoteNode, State)
     end, nodes()).
 
--spec raw_purge_registry_entries_for_remote_node(Node :: atom()) -> ok.
-raw_purge_registry_entries_for_remote_node(Node) when Node =/= node() ->
+-spec raw_purge_registry_entries_for_remote_node(Node :: atom(), SynRegistryByName :: atom()) -> ok.
+raw_purge_registry_entries_for_remote_node(Node, SynRegistryByName) when Node =/= node() ->
     %% NB: no demonitoring is done, this is why it's raw
-    ets:match_delete(syn_registry_by_name, {{'_', '_'}, '_', '_', '_', Node}),
+    ets:match_delete(SynRegistryByName, {{'_', '_'}, '_', '_', '_', Node}),
     ets:match_delete(syn_registry_by_pid, {{'_', '_'}, '_', '_', '_', Node}),
     ok.
 
--spec rebuild_monitors() -> ok.
-rebuild_monitors() ->
-    RegistryTuples = get_registry_tuples_for_node(node()),
+-spec rebuild_monitors(SynRegistryByName :: atom()) -> ok.
+rebuild_monitors(SynRegistryByName) ->
+    RegistryTuples = get_registry_tuples_for_node(node(), SynRegistryByName),
     lists:foreach(fun({Name, Pid, Meta, Time}) ->
         case is_process_alive(Pid) of
             true ->
                 MonitorRef = erlang:monitor(process, Pid),
                 %% overwrite
-                add_to_local_table(Name, Pid, Meta, Time, MonitorRef);
+                add_to_local_table(Name, Pid, Meta, Time, MonitorRef, SynRegistryByName);
             _ ->
-                remove_from_local_table(Name, Pid)
+                remove_from_local_table(Name, Pid, SynRegistryByName)
         end
     end, RegistryTuples).
 

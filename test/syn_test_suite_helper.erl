@@ -26,7 +26,7 @@
 -module(syn_test_suite_helper).
 
 %% API
--export([start_slave/1, start_slave/4]).
+-export([start_slave/1, start_slave/5]).
 -export([stop_slave/1, stop_slave/2]).
 -export([connect_node/1, disconnect_node/1]).
 -export([clean_after_test/0]).
@@ -35,6 +35,7 @@
 -export([use_custom_handler/0]).
 -export([use_anti_entropy/2]).
 -export([send_error_logger_to_disk/0]).
+-export([kill_sharded/1]).
 
 %% internal
 -export([process_main/0]).
@@ -47,9 +48,10 @@ start_slave(NodeShortName) ->
     CodePath = code:get_path(),
     true = rpc:call(Node, code, set_path, [CodePath]),
     {ok, Node}.
-start_slave(NodeShortName, Host, Username, Password) ->
+start_slave(NodeShortName, Host, Port, Username, Password) ->
     {ok, Node} = ct_slave:start(Host, NodeShortName, [
         {boot_timeout, 10},
+        {ssh_port, Port},
         {username, Username},
         {password, Password}
     ]),
@@ -115,6 +117,14 @@ use_anti_entropy(groups, Interval) ->
 
 send_error_logger_to_disk() ->
     error_logger:logfile({open, atom_to_list(node())}).
+
+kill_sharded(Module) ->
+    SynInstances = application:get_env(syn, syn_shards, 1),
+    lists:foreach(fun (I) ->
+        Name = syn_sup:get_process_name(Module, I),
+        exit(whereis(Name), kill)
+                  end, lists:seq(1, SynInstances)
+    ).
 
 %% ===================================================================
 %% Internal

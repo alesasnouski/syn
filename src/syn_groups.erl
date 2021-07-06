@@ -27,7 +27,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/2]).
 -export([join/2, join/3]).
 -export([leave/2]).
 -export([get_members/1, get_members/2]).
@@ -42,16 +42,16 @@
 
 %% sync API
 -export([sync_join/4, sync_leave/3]).
--export([sync_get_local_groups_tuples/1]).
+-export([sync_get_local_groups_tuples/2]).
 -export([force_cluster_sync/0]).
--export([remove_from_local_table/2]).
+-export([remove_from_local_table/3]).
 
 %% internal
 -export([multicast_loop/0]).
 
 %% tests
 -ifdef(TEST).
--export([add_to_local_table/4]).
+-export([add_to_local_table/5]).
 -endif.
 
 %% gen_server callbacks
@@ -65,7 +65,9 @@
     custom_event_handler :: undefined | module(),
     anti_entropy_interval_ms :: undefined | non_neg_integer(),
     anti_entropy_interval_max_deviation_ms :: undefined | non_neg_integer(),
-    multicast_pid :: undefined | pid()
+    multicast_pid :: undefined | pid(),
+    syn_groups_by_name :: atom(),
+    process_name :: atom()
 }).
 
 %% macros
@@ -77,10 +79,10 @@
 %% ===================================================================
 %% API
 %% ===================================================================
--spec start_link() -> {ok, pid()} | {error, any()}.
-start_link() ->
+-spec start_link(atom(), integer()) -> {ok, pid()} | {error, any()}.
+start_link(ProcessName, Id) ->
     Options = [],
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], Options).
+    gen_server:start_link({local, ProcessName}, ?MODULE, {ProcessName, Id}, Options).
 
 -spec join(GroupName :: any(), Pid :: pid()) -> ok.
 join(GroupName, Pid) ->
@@ -89,21 +91,25 @@ join(GroupName, Pid) ->
 -spec join(GroupName :: any(), Pid :: pid(), Meta :: any()) -> ok.
 join(GroupName, Pid, Meta) when is_pid(Pid) ->
     Node = node(Pid),
-    gen_server:call({?MODULE, Node}, {join_on_node, GroupName, Pid, Meta}).
+    GenServerName = syn_sup:get_process_name(syn_groups, syn_backbone:get_shard(GroupName)),
+    gen_server:call({GenServerName, Node}, {join_on_node, GroupName, Pid, Meta}).
 
 -spec leave(GroupName :: any(), Pid :: pid()) -> ok | {error, Reason :: any()}.
 leave(GroupName, Pid) ->
-    case find_groups_entry_by_name_and_pid(GroupName, Pid) of
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
+    case find_groups_entry_by_name_and_pid(GroupName, Pid, SynGroupsByName) of
         undefined ->
             {error, not_in_group};
         _ ->
             Node = node(Pid),
-            gen_server:call({?MODULE, Node}, {leave_on_node, GroupName, Pid})
+            GenServerName = syn_sup:get_process_name(syn_groups, syn_backbone:get_shard(GroupName)),
+            gen_server:call({GenServerName, Node}, {leave_on_node, GroupName, Pid})
     end.
 
 -spec get_members(Name :: any()) -> [pid()].
 get_members(GroupName) ->
-    ets:select(syn_groups_by_name, [{
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
+    ets:select(SynGroupsByName, [{
         {{GroupName, '$2'}, '_', '_', '_'},
         [],
         ['$2']
@@ -111,7 +117,8 @@ get_members(GroupName) ->
 
 -spec get_members(GroupName :: any(), with_meta) -> [{pid(), Meta :: any()}].
 get_members(GroupName, with_meta) ->
-    ets:select(syn_groups_by_name, [{
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
+    ets:select(SynGroupsByName, [{
         {{GroupName, '$2'}, '$3', '_', '_'},
         [],
         [{{'$2', '$3'}}]
@@ -119,17 +126,24 @@ get_members(GroupName, with_meta) ->
 
 -spec get_group_names() -> [GroupName :: any()].
 get_group_names() ->
-    Groups = ets:select(syn_groups_by_name, [{
-      {{'$1', '_'}, '_', '_', '_'},
-      [],
-      ['$1']
-    }]),
-    Set = sets:from_list(Groups),
-    sets:to_list(Set).
+    SynShards = application:get_env(syn, syn_shards, 1),
+    GroupNames = lists:foldl(fun(ShardId, Acc) ->
+        SynGroupsByName = maps:get(syn_groups_by_name, syn_backbone:ets_names(ShardId)),
+        Groups = ets:select(SynGroupsByName, [{
+            {{'$1', '_'}, '_', '_', '_'},
+            [],
+            ['$1']
+        }]),
+        Set = sets:from_list(Groups),
+        GroupsL = sets:to_list(Set),
+        [GroupsL | Acc]
+    end, [], lists:seq(1, SynShards)),
+    lists:flatten(GroupNames).
 
 -spec member(Pid :: pid(), GroupName :: any()) -> boolean().
 member(Pid, GroupName) ->
-    case find_groups_entry_by_name_and_pid(GroupName, Pid) of
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
+    case find_groups_entry_by_name_and_pid(GroupName, Pid, SynGroupsByName) of
         undefined -> false;
         _ -> true
     end.
@@ -137,50 +151,70 @@ member(Pid, GroupName) ->
 -spec get_local_members(Name :: any()) -> [pid()].
 get_local_members(GroupName) ->
     Node = node(),
-    ets:select(syn_groups_by_name, [{
-        {{GroupName, '$2'}, '_', '_', Node},
-        [],
-        ['$2']
-    }]).
+    SynShards = application:get_env(syn, syn_shards, 1),
+    Members = lists:foldl(fun(ShardId, Acc) ->
+        EtsName = maps:get(syn_groups_by_name, syn_backbone:ets_names(ShardId)),
+        GroupMembers = ets:select(EtsName, [{
+            {{GroupName, '$2'}, '_', '_', Node},
+            [],
+            ['$2']
+        }]),
+        [GroupMembers | Acc]
+    end, [], lists:seq(1, SynShards)),
+    lists:flatten(Members).
 
 -spec get_local_members(GroupName :: any(), with_meta) -> [{pid(), Meta :: any()}].
 get_local_members(GroupName, with_meta) ->
     Node = node(),
-    ets:select(syn_groups_by_name, [{
-        {{GroupName, '$2'}, '$3', '_', Node},
-        [],
-        [{{'$2', '$3'}}]
-    }]).
+    SynShards = application:get_env(syn, syn_shards, 1),
+    Members = lists:foldl(fun(ShardId, Acc) ->
+        SynGroupsByName = maps:get(syn_groups_by_name, syn_backbone:ets_names(ShardId)),
+        GroupMembers = ets:select(SynGroupsByName, [{
+            {{GroupName, '$2'}, '$3', '_', Node},
+            [],
+            [{{'$2', '$3'}}]              %% TODO: rewrite funs
+        }]),
+        [GroupMembers | Acc]
+    end, [], lists:seq(1, SynShards)),
+    lists:flatten(Members).
 
 -spec local_member(Pid :: pid(), GroupName :: any()) -> boolean().
 local_member(Pid, GroupName) ->
-    case find_groups_entry_by_name_and_pid(GroupName, Pid) of
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
+    case find_groups_entry_by_name_and_pid(GroupName, Pid, SynGroupsByName) of
         {GroupName, Pid, _Meta, _MonitorRef, Node} when Node =:= node() ->
             true;
-
         _ ->
             false
     end.
 
 -spec count() -> non_neg_integer().
 count() ->
-    Entries = ets:select(syn_groups_by_name, [{
-        {{'$1', '_'}, '_', '_',  '_'},
-        [],
-        ['$1']
-    }]),
-    Set = sets:from_list(Entries),
-    sets:size(Set).
+    SynShards = application:get_env(syn, syn_shards, 1),
+    lists:foldl(fun(ShardId, Acc) ->
+        SynGroupsByName = maps:get(syn_groups_by_name, syn_backbone:ets_names(ShardId)),
+        Entries = ets:select(SynGroupsByName, [{
+            {{'$1', '_'}, '_', '_',  '_'},   %%%% TODO: rewrite funs
+            [],
+            ['$1']
+        }]),
+        Set = sets:from_list(Entries),
+        sets:size(Set) + Acc
+    end, 0, lists:seq(1, SynShards)).
 
 -spec count(Node :: node()) -> non_neg_integer().
 count(Node) ->
-    Entries = ets:select(syn_groups_by_name, [{
-        {{'$1', '_'}, '_', '_',  Node},
-        [],
-        ['$1']
-    }]),
-    Set = sets:from_list(Entries),
-    sets:size(Set).
+    SynShards = application:get_env(syn, syn_shards, 1),
+    lists:foldl(fun(ShardId, Acc) ->
+        SynGroupsByName = maps:get(syn_groups_by_name, syn_backbone:ets_names(ShardId)),
+        Entries = ets:select(SynGroupsByName, [{
+            {{'$1', '_'}, '_', '_',  Node},
+            [],
+            ['$1']
+        }]),
+        Set = sets:from_list(Entries),
+        sets:size(Set) + Acc
+    end, 0, lists:seq(1, SynShards)).
 
 -spec publish(GroupName :: any(), Message :: any()) -> {ok, RecipientCount :: non_neg_integer()}.
 publish(GroupName, Message) ->
@@ -227,10 +261,13 @@ sync_join(RemoteNode, GroupName, Pid, Meta) ->
 sync_leave(RemoteNode, GroupName, Pid) ->
     gen_server:cast({?MODULE, RemoteNode}, {sync_leave, GroupName, Pid}).
 
--spec sync_get_local_groups_tuples(FromNode :: node()) -> list(syn_groups_tuple()).
-sync_get_local_groups_tuples(FromNode) ->
-    error_logger:info_msg("Syn(~p): Received request of local group tuples from remote node: ~p~n", [node(), FromNode]),
-    get_groups_tuples_for_node(node()).
+-spec sync_get_local_groups_tuples(FromNode :: node(), SynGroupsByName :: atom()) -> list(syn_groups_tuple()).
+sync_get_local_groups_tuples(FromNode, SynGroupsByName) ->
+    error_logger:info_msg(
+        "Syn(~p): Received request of local group tuples for ets table ~p from remote node: ~p~n",
+        [node(), SynGroupsByName, FromNode]
+    ),
+    get_groups_tuples_for_node(node(), SynGroupsByName).
 
 -spec force_cluster_sync() -> ok.
 force_cluster_sync() ->
@@ -245,16 +282,18 @@ force_cluster_sync() ->
 %% ----------------------------------------------------------------------------------------------------------
 %% Init
 %% ----------------------------------------------------------------------------------------------------------
--spec init([]) ->
+-spec init({ProcessName :: atom(), Id :: integer()}) ->
     {ok, #state{}} |
     {ok, #state{}, Timeout :: non_neg_integer()} |
     ignore |
     {stop, Reason :: any()}.
-init([]) ->
+init({ProcessName, Id}) ->
     %% monitor nodes
     ok = net_kernel:monitor_nodes(true),
     %% rebuild
-    rebuild_monitors(),
+    EtsTables = syn_backbone:ets_names(Id),
+    SynGroupsByName = maps:get(syn_groups_by_name, EtsTables),
+    rebuild_monitors(SynGroupsByName),
     %% start multicast process
     MulticastPid = spawn_link(?MODULE, multicast_loop, []),
     %% get handler
@@ -266,7 +305,9 @@ init([]) ->
         custom_event_handler = CustomEventHandler,
         anti_entropy_interval_ms = AntiEntropyIntervalMs,
         anti_entropy_interval_max_deviation_ms = AntiEntropyIntervalMaxDeviationMs,
-        multicast_pid = MulticastPid
+        multicast_pid = MulticastPid,
+        syn_groups_by_name = SynGroupsByName,
+        process_name = ProcessName
     },
     %% send message to initiate full cluster sync
     timer:send_after(0, self(), sync_from_full_cluster),
@@ -299,8 +340,8 @@ handle_call({join_on_node, GroupName, Pid, Meta}, _From, State) ->
             {reply, {error, not_alive}, State}
     end;
 
-handle_call({leave_on_node, GroupName, Pid}, _From, State) ->
-    case leave_on_node(GroupName, Pid) of
+handle_call({leave_on_node, GroupName, Pid}, _From, #state{syn_groups_by_name = SynGroupsByName} = State) ->
+    case leave_on_node(GroupName, Pid, SynGroupsByName) of
         ok ->
             %% multicast
             multicast_leave(GroupName, Pid, State),
@@ -311,8 +352,11 @@ handle_call({leave_on_node, GroupName, Pid}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
-handle_call(Request, From, State) ->
-    error_logger:warning_msg("Syn(~p): Received from ~p an unknown call message: ~p~n", [node(), Request, From]),
+handle_call(Request, From, #state{process_name = ProcName} = State) ->
+    error_logger:warning_msg(
+        "Syn(~p ~p): Received from ~p an unknown call message: ~p~n",
+        [node(), ProcName, From, Request]
+    ),
     {reply, undefined, State}.
 
 %% ----------------------------------------------------------------------------------------------------------
@@ -325,23 +369,27 @@ handle_call(Request, From, State) ->
 
 handle_cast({sync_join, GroupName, Pid, Meta}, State) ->
     %% add to table
-    add_to_local_table(GroupName, Pid, Meta, undefined),
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
+    add_to_local_table(GroupName, Pid, Meta, undefined, SynGroupsByName),
     %% return
     {noreply, State};
 
-handle_cast({sync_leave, GroupName, Pid}, State) ->
+handle_cast({sync_leave, GroupName, Pid}, #state{syn_groups_by_name = SynGroupsByName} = State) ->
     %% remove entry
-    remove_from_local_table(GroupName, Pid),
+    remove_from_local_table(GroupName, Pid, SynGroupsByName),
     %% return
     {noreply, State};
 
-handle_cast(force_cluster_sync, State) ->
-    error_logger:info_msg("Syn(~p): Initiating full cluster groups FORCED sync for nodes: ~p~n", [node(), nodes()]),
-    do_sync_from_full_cluster(),
+handle_cast(force_cluster_sync, #state{syn_groups_by_name = SynGroupsByName, process_name = ProcName} = State) ->
+    error_logger:info_msg(
+        "Syn(~p ~p): Initiating cluster groups ~p FORCED sync for nodes: ~p~n",
+        [node(), ProcName, nodes()]
+    ),
+    do_sync_from_full_cluster(SynGroupsByName),
     {noreply, State};
 
-handle_cast(Msg, State) ->
-    error_logger:warning_msg("Syn(~p): Received an unknown cast message: ~p~n", [node(), Msg]),
+handle_cast(Msg, #state{process_name = ProcName} = State) ->
+    error_logger:warning_msg("Syn(~p ~p): Received an unknown cast message: ~p~n", [node(), ProcName, Msg]),
     {noreply, State}.
 
 %% ----------------------------------------------------------------------------------------------------------
@@ -352,7 +400,7 @@ handle_cast(Msg, State) ->
     {noreply, #state{}, Timeout :: non_neg_integer()} |
     {stop, Reason :: any(), #state{}}.
 
-handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
+handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, #state{syn_groups_by_name = SynGroupsByName} = State) ->
     case find_groups_tuples_by_pid(Pid) of
         [] ->
             %% handle
@@ -361,7 +409,7 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
         GroupTuples ->
             lists:foreach(fun({GroupName, _Pid, Meta}) ->
                 %% remove from table
-                remove_from_local_table(GroupName, Pid),
+                remove_from_local_table(GroupName, Pid, SynGroupsByName),
                 %% handle
                 handle_process_down(GroupName, Pid, Meta, Reason, State),
                 %% multicast
@@ -371,30 +419,39 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
     %% return
     {noreply, State};
 
-handle_info({nodeup, RemoteNode}, State) ->
-    error_logger:info_msg("Syn(~p): Node ~p has joined the cluster~n", [node(), RemoteNode]),
-    groups_automerge(RemoteNode),
+handle_info({nodeup, RemoteNode}, #state{syn_groups_by_name = SynGroupsByName} = State) ->
+    error_logger:info_msg("Syn(~p): Node ~p ~p has joined the cluster~n", [node(), SynGroupsByName, RemoteNode]),
+    groups_automerge(RemoteNode, SynGroupsByName),
     %% resume
     {noreply, State};
 
-handle_info({nodedown, RemoteNode}, State) ->
-    error_logger:warning_msg("Syn(~p): Node ~p has left the cluster, removing group entries on local~n", [node(), RemoteNode]),
-    raw_purge_group_entries_for_node(RemoteNode),
+handle_info({nodedown, RemoteNode}, #state{process_name = ProcName, syn_groups_by_name = SynGroupsByName} = State) ->
+    error_logger:warning_msg(
+        "Syn(~p ~p): Node ~p for ~p has left the cluster, removing group entries on local~n",
+        [node(), ProcName, RemoteNode]
+    ),
+    raw_purge_group_entries_for_node(RemoteNode, SynGroupsByName),
     {noreply, State};
 
-handle_info(sync_from_full_cluster, State) ->
-    error_logger:info_msg("Syn(~p): Initiating full cluster groups sync for nodes: ~p~n", [node(), nodes()]),
-    do_sync_from_full_cluster(),
+handle_info(sync_from_full_cluster, #state{syn_groups_by_name = SynGroupsByName, process_name = ProcName} = State) ->
+    error_logger:info_msg(
+        "Syn(~p ~p): Initiating full cluster groups FORCED sync for nodes: ~p~n",
+        [node(), ProcName, nodes()]
+    ),
+    do_sync_from_full_cluster(SynGroupsByName),
     {noreply, State};
 
-handle_info(sync_anti_entropy, State) ->
+handle_info(sync_anti_entropy, #state{syn_groups_by_name = SynGroupsByName, process_name = ProcName} = State) ->
     %% sync
     RemoteNodes = nodes(),
     case length(RemoteNodes) > 0 of
         true ->
             RandomRemoteNode = lists:nth(rand:uniform(length(RemoteNodes)), RemoteNodes),
-            error_logger:info_msg("Syn(~p): Initiating anti-entropy sync for node ~p~n", [node(), RandomRemoteNode]),
-            groups_automerge(RandomRemoteNode);
+            error_logger:info_msg(
+                "Syn(~p ~p): Initiating anti-entropy sync for node ~p~n",
+                [node(), ProcName, RandomRemoteNode]
+            ),
+            groups_automerge(RandomRemoteNode, SynGroupsByName);
 
         _ ->
             ok
@@ -404,8 +461,8 @@ handle_info(sync_anti_entropy, State) ->
     %% return
     {noreply, State};
 
-handle_info(Info, State) ->
-    error_logger:warning_msg("Syn(~p): Received an unknown info message: ~p~n", [node(), Info]),
+handle_info(Info, #state{process_name = ProcName} = State) ->
+    error_logger:warning_msg("Syn(~p ~p): Received an unknown info message: ~p~n", [node(), ProcName, Info]),
     {noreply, State}.
 
 %% ----------------------------------------------------------------------------------------------------------
@@ -413,9 +470,10 @@ handle_info(Info, State) ->
 %% ----------------------------------------------------------------------------------------------------------
 -spec terminate(Reason :: any(), #state{}) -> terminated.
 terminate(Reason, #state{
-    multicast_pid = MulticastPid
+    multicast_pid = MulticastPid,
+    process_name = ProcName
 }) ->
-    error_logger:info_msg("Syn(~p): Terminating with reason: ~p~n", [node(), Reason]),
+    error_logger:info_msg("Syn(~p ~p): Terminating with reason: ~p~n", [node(), ProcName, Reason]),
     MulticastPid ! terminate,
     terminated.
 
@@ -452,11 +510,12 @@ join_on_node(GroupName, Pid, Meta) ->
             MRef
     end,
     %% add to table
-    add_to_local_table(GroupName, Pid, Meta, MonitorRef).
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
+    add_to_local_table(GroupName, Pid, Meta, MonitorRef, SynGroupsByName).
 
--spec leave_on_node(GroupName :: any(), Pid :: pid()) -> ok | {error, Reason :: any()}.
-leave_on_node(GroupName, Pid) ->
-    case find_groups_entry_by_name_and_pid(GroupName, Pid) of
+-spec leave_on_node(GroupName :: any(), Pid :: pid(), SynGroupsByName :: atom()) -> ok | {error, Reason :: any()}.
+leave_on_node(GroupName, Pid, SynGroupsByName) ->
+    case find_groups_entry_by_name_and_pid(GroupName, Pid, SynGroupsByName) of
         undefined ->
             {error, not_in_group};
 
@@ -471,7 +530,7 @@ leave_on_node(GroupName, Pid) ->
                     ok
             end,
             %% remove from table
-            remove_from_local_table(GroupName, Pid);
+            remove_from_local_table(GroupName, Pid, SynGroupsByName);
 
         {GroupName, Pid, _Meta, _MonitorRef, Node} = GroupsEntry when Node =:= node() ->
             error_logger:error_msg(
@@ -479,7 +538,7 @@ leave_on_node(GroupName, Pid) ->
                 [node(), GroupsEntry]
             ),
             %% remove from table
-            remove_from_local_table(GroupName, Pid);
+            remove_from_local_table(GroupName, Pid, SynGroupsByName);
 
         _ ->
             %% race condition: leave request but entry in table is not a local pid (has no monitor)
@@ -487,20 +546,24 @@ leave_on_node(GroupName, Pid) ->
             ok
     end.
 
--spec add_to_local_table(GroupName :: any(), Pid :: pid(), Meta :: any(), MonitorRef :: undefined | reference()) -> ok.
-add_to_local_table(GroupName, Pid, Meta, MonitorRef) ->
-    ets:insert(syn_groups_by_name, {{GroupName, Pid}, Meta, MonitorRef, node(Pid)}),
+-spec add_to_local_table(
+    GroupName :: any(), Pid :: pid(), Meta :: any(),
+    MonitorRef :: undefined | reference(),
+    SynGroupsByName :: atom()
+) -> ok.
+add_to_local_table(GroupName, Pid, Meta, MonitorRef, SynGroupsByName) ->
+    ets:insert(SynGroupsByName, {{GroupName, Pid}, Meta, MonitorRef, node(Pid)}),
     ets:insert(syn_groups_by_pid, {{Pid, GroupName}, Meta, MonitorRef, node(Pid)}),
     ok.
 
--spec remove_from_local_table(GroupName :: any(), Pid :: pid()) -> ok | {error, Reason :: any()}.
-remove_from_local_table(GroupName, Pid) ->
-    case ets:lookup(syn_groups_by_name, {GroupName, Pid}) of
+-spec remove_from_local_table(GroupName :: any(), Pid :: pid(), SynGroupsByName :: atom()) -> ok | {error, Reason :: any()}.
+remove_from_local_table(GroupName, Pid, SynGroupsByName) ->
+    case ets:lookup(SynGroupsByName, {GroupName, Pid}) of
         [] ->
             {error, not_in_group};
 
         _ ->
-            ets:match_delete(syn_groups_by_name, {{GroupName, Pid}, '_', '_', '_'}),
+            ets:match_delete(SynGroupsByName, {{GroupName, Pid}, '_', '_', '_'}),
             ets:match_delete(syn_groups_by_pid, {{Pid, GroupName}, '_', '_', '_'}),
             ok
     end.
@@ -513,9 +576,10 @@ find_groups_tuples_by_pid(Pid) when is_pid(Pid) ->
         [{{'$2', Pid, '$3'}}]
     }]).
 
--spec find_groups_entry_by_name_and_pid(GroupName :: any(), Pid :: pid()) -> Entry :: syn_groups_entry() | undefined.
-find_groups_entry_by_name_and_pid(GroupName, Pid) ->
-    case ets:select(syn_groups_by_name, [{
+-spec find_groups_entry_by_name_and_pid(GroupName :: any(), Pid :: pid(), SynGroupsByName :: atom()) ->
+    Entry :: syn_groups_entry() | undefined.
+find_groups_entry_by_name_and_pid(GroupName, Pid, SynGroupsByName) ->
+    case ets:select(SynGroupsByName, [{
         {{GroupName, Pid}, '$3', '$4', '$5'},
         [],
         [{{{const, GroupName}, Pid, '$3', '$4', '$5'}}]
@@ -535,9 +599,9 @@ find_monitor_for_pid(Pid) when is_pid(Pid) ->
         _ -> undefined
     end.
 
--spec get_groups_tuples_for_node(Node :: node()) -> [syn_groups_tuple()].
-get_groups_tuples_for_node(Node) ->
-    ets:select(syn_groups_by_name, [{
+-spec get_groups_tuples_for_node(Node :: node(), SynGroupsByName :: atom()) -> [syn_groups_tuple()].
+get_groups_tuples_for_node(Node, SynGroupsByName) ->
+    ets:select(SynGroupsByName, [{
         {{'$1', '$2'}, '$3', '_', Node},
         [],
         [{{'$1', '$2', '$3'}}]
@@ -545,60 +609,75 @@ get_groups_tuples_for_node(Node) ->
 
 -spec handle_process_down(GroupName :: any(), Pid :: pid(), Meta :: any(), Reason :: any(), #state{}) -> ok.
 handle_process_down(GroupName, Pid, Meta, Reason, #state{
-    custom_event_handler = CustomEventHandler
+    custom_event_handler = CustomEventHandler,
+    process_name = ProcName
 }) ->
     case GroupName of
         undefined ->
             error_logger:warning_msg(
-                "Syn(~p): Received a DOWN message from an unjoined group process ~p with reason: ~p~n",
-                [node(), Pid, Reason]
+                "Syn(~p ~p): Received a DOWN message from an unjoined group process ~p with reason: ~p~n",
+                [node(), ProcName, Pid, Reason]
             );
         _ ->
             syn_event_handler:do_on_group_process_exit(GroupName, Pid, Meta, Reason, CustomEventHandler)
     end.
 
--spec groups_automerge(RemoteNode :: node()) -> ok.
-groups_automerge(RemoteNode) ->
+-spec groups_automerge(RemoteNode :: node(), SynGroupsByName :: atom()) -> ok.
+groups_automerge(RemoteNode, SynGroupsByName) ->
     global:trans({{?MODULE, auto_merge_groups}, self()},
         fun() ->
-            error_logger:info_msg("Syn(~p): GROUPS AUTOMERGE ----> Initiating for remote node ~p~n", [node(), RemoteNode]),
+            error_logger:info_msg(
+                "Syn(~p): GROUPS AUTOMERGE ----> Initiating for remote node ~p ~p~n",
+                [node(), SynGroupsByName, RemoteNode]
+            ),
             %% get group tuples from remote node
-            case rpc:call(RemoteNode, ?MODULE, sync_get_local_groups_tuples, [node()]) of
+            case rpc:call(RemoteNode, ?MODULE, sync_get_local_groups_tuples, [node(), SynGroupsByName]) of
                 {badrpc, _} ->
-                    error_logger:info_msg("Syn(~p): GROUPS AUTOMERGE <---- Syn not ready on remote node ~p, postponing~n", [node(), RemoteNode]);
+                    error_logger:info_msg(
+                        "Syn(~p): GROUPS AUTOMERGE <---- Syn not ready on remote node ~p ~p, postponing~n",
+                        [node(), SynGroupsByName, RemoteNode]
+                    );
 
                 GroupTuples ->
                     error_logger:info_msg(
-                        "Syn(~p): Received ~p group tuple(s) from remote node ~p~n",
-                        [node(), length(GroupTuples), RemoteNode]
+                        "Syn(~p): Received ~p group tuple(s) from remote node ~p ~p~n",
+                        [node(), length(GroupTuples), SynGroupsByName, RemoteNode]
                     ),
                     %% ensure that groups doesn't have any joining node's entries
-                    raw_purge_group_entries_for_node(RemoteNode),
+                    raw_purge_group_entries_for_node(RemoteNode, SynGroupsByName),
                     %% add
                     lists:foreach(fun({GroupName, RemotePid, RemoteMeta}) ->
                         case rpc:call(node(RemotePid), erlang, is_process_alive, [RemotePid]) of
                             true ->
-                                add_to_local_table(GroupName, RemotePid, RemoteMeta, undefined);
+                                add_to_local_table(
+                                    GroupName, RemotePid, RemoteMeta, undefined, SynGroupsByName
+                                );
                             _ ->
-                                ok = rpc:call(RemoteNode, syn_groups, remove_from_local_table, [GroupName, RemotePid])
+                                ok = rpc:call(
+                                    RemoteNode, syn_groups, remove_from_local_table,
+                                    [GroupName, RemotePid, SynGroupsByName]
+                                )
                         end
                     end, GroupTuples),
                     %% exit
-                    error_logger:info_msg("Syn(~p): GROUPS AUTOMERGE <---- Done for remote node ~p~n", [node(), RemoteNode])
+                    error_logger:info_msg(
+                        "Syn(~p): GROUPS AUTOMERGE <---- Done for remote node ~p ~p~n",
+                        [node(), SynGroupsByName, RemoteNode]
+                    )
             end
         end
     ).
 
--spec do_sync_from_full_cluster() -> ok.
-do_sync_from_full_cluster() ->
+-spec do_sync_from_full_cluster(SynGroupsByName :: atom()) -> ok.
+do_sync_from_full_cluster(SynGroupsByName) ->
     lists:foreach(fun(RemoteNode) ->
-        groups_automerge(RemoteNode)
+        groups_automerge(RemoteNode, SynGroupsByName)
     end, nodes()).
 
--spec raw_purge_group_entries_for_node(Node :: atom()) -> ok.
-raw_purge_group_entries_for_node(Node) ->
+-spec raw_purge_group_entries_for_node(Node :: atom(), SynGroupsByName :: atom()) -> ok.
+raw_purge_group_entries_for_node(Node, SynGroupsByName) ->
     %% NB: no demonitoring is done, this is why it's raw
-    ets:match_delete(syn_groups_by_name, {{'_', '_'}, '_', '_', Node}),
+    ets:match_delete(SynGroupsByName, {{'_', '_'}, '_', '_', Node}),
     ets:match_delete(syn_groups_by_pid, {{'_', '_'}, '_', '_', Node}),
     ok.
 
@@ -639,18 +718,18 @@ collect_replies(MemberPids, Replies, BadPids) ->
             collect_replies(MemberPids1, Replies, [Pid | BadPids])
     end.
 
--spec rebuild_monitors() -> ok.
-rebuild_monitors() ->
-    GroupTuples = get_groups_tuples_for_node(node()),
+-spec rebuild_monitors(SynGroupsByName :: atom()) -> ok.
+rebuild_monitors(SynGroupsByName) ->
+    GroupTuples = get_groups_tuples_for_node(node(), SynGroupsByName),
     %% ensure that groups doesn't have any joining node's entries
-    raw_purge_group_entries_for_node(node()),
+    raw_purge_group_entries_for_node(node(), SynGroupsByName),
     %% add
     lists:foreach(fun({GroupName, Pid, Meta}) ->
         case erlang:is_process_alive(Pid) of
             true ->
                 join_on_node(GroupName, Pid, Meta);
             _ ->
-                remove_from_local_table(GroupName, Pid)
+                remove_from_local_table(GroupName, Pid, SynGroupsByName)
         end
     end, GroupTuples).
 
