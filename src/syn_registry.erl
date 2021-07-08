@@ -409,7 +409,7 @@ handle_cast(
     {sync_demonitor_and_kill_on_node, Name, Pid, Meta, MonitorRef, Kill},
     #state{process_name = ProcessName} = State
 ) ->
-    error_logger:info_msg("Syn(~p ~p): Sync ~p demonitoring pid ~p~n", [node(), ProcessName, Pid]),
+    error_logger:info_msg("Syn(~p ~p): Sync demonitoring pid ~p~n", [node(), ProcessName, Pid]),
     %% demonitor
     catch erlang:demonitor(MonitorRef, [flush]),
     %% kill
