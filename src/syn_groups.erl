@@ -191,30 +191,32 @@ local_member(Pid, GroupName) ->
 -spec count() -> non_neg_integer().
 count() ->
     SynShards = application:get_env(syn, syn_shards, 1),
-    lists:foldl(fun(ShardId, Acc) ->
+    GroupsL = lists:foldl(fun(ShardId, Acc) ->
         SynGroupsByName = maps:get(syn_groups_by_name, syn_backbone:ets_names(ShardId)),
         Entries = ets:select(SynGroupsByName, [{
             {{'$1', '_'}, '_', '_',  '_'},   %%%% TODO: rewrite funs
             [],
             ['$1']
         }]),
-        Set = sets:from_list(Entries),
-        sets:size(Set) + Acc
-    end, 0, lists:seq(1, SynShards)).
+        [Entries | Acc]
+    end, 0, lists:seq(1, SynShards)),
+    GroupsSet = sets:from_list(lists:flatten(GroupsL)),
+    sets:size(GroupsSet).
 
 -spec count(Node :: node()) -> non_neg_integer().
 count(Node) ->
     SynShards = application:get_env(syn, syn_shards, 1),
-    lists:foldl(fun(ShardId, Acc) ->
+    GroupsL = lists:foldl(fun(ShardId, Acc) ->
         SynGroupsByName = maps:get(syn_groups_by_name, syn_backbone:ets_names(ShardId)),
         Entries = ets:select(SynGroupsByName, [{
             {{'$1', '_'}, '_', '_',  Node},
             [],
             ['$1']
         }]),
-        Set = sets:from_list(Entries),
-        sets:size(Set) + Acc
-    end, 0, lists:seq(1, SynShards)).
+        [Entries | Acc]
+    end, 0, lists:seq(1, SynShards)),
+    GroupsSet = sets:from_list(lists:flatten(GroupsL)),
+    sets:size(GroupsSet).
 
 -spec publish(GroupName :: any(), Message :: any()) -> {ok, RecipientCount :: non_neg_integer()}.
 publish(GroupName, Message) ->
