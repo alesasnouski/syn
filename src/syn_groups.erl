@@ -199,7 +199,7 @@ count() ->
             ['$1']
         }]),
         [Entries | Acc]
-    end, 0, lists:seq(1, SynShards)),
+    end, [], lists:seq(1, SynShards)),
     GroupsSet = sets:from_list(lists:flatten(GroupsL)),
     sets:size(GroupsSet).
 
@@ -214,7 +214,7 @@ count(Node) ->
             ['$1']
         }]),
         [Entries | Acc]
-    end, 0, lists:seq(1, SynShards)),
+    end, [], lists:seq(1, SynShards)),
     GroupsSet = sets:from_list(lists:flatten(GroupsL)),
     sets:size(GroupsSet).
 
