@@ -453,10 +453,10 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, #state{syn_registry_by_
     %% return
     {noreply, State};
 
-handle_info({nodeup, RemoteNode}, #state{syn_registry_by_name = SynRegistryByName, process_name = ProcName} = State) ->
+handle_info({nodeup, RemoteNode}, #state{process_name = ProcName} = State) ->
     error_logger:info_msg(
         "Syn(~p ~p): Node has joined the cluster ~p~n",
-        [node(), ProcName, RemoteNode, SynRegistryByName]
+        [node(), ProcName, RemoteNode]
     ),
     registry_automerge(RemoteNode, State),
     %% resume
