@@ -427,7 +427,7 @@ handle_info({nodeup, RemoteNode}, #state{syn_groups_by_name = SynGroupsByName} =
 
 handle_info({nodedown, RemoteNode}, #state{process_name = ProcName, syn_groups_by_name = SynGroupsByName} = State) ->
     error_logger:warning_msg(
-        "Syn(~p ~p): Node ~p for ~p has left the cluster, removing group entries on local~n",
+        "Syn(~p ~p): Node ~p has left the cluster, removing group entries on local~n",
         [node(), ProcName, RemoteNode]
     ),
     raw_purge_group_entries_for_node(RemoteNode, SynGroupsByName),
