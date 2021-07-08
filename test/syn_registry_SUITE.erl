@@ -536,9 +536,8 @@ two_nodes_registration_race_condition_conflict_resolution_keep_more_recent_remot
     Pid0 = syn_test_suite_helper:start_process(),
     Pid1 = syn_test_suite_helper:start_process(SlaveNode),
     %% inject into syn to simulate concurrent registration
-    SynRegistryByName0 = syn_backbone:get_ets(ConflictingName, syn_registry_by_name),
     ok = syn_registry:add_to_local_table(
-        ConflictingName, Pid0, node(), erlang:system_time() - 1000000000, undefined, SynRegistryByName0
+        ConflictingName, Pid0, node(), erlang:system_time() - 1000000000, undefined
     ),
     %% register on slave node to trigger conflict resolution on master node
     ok = rpc:call(SlaveNode, syn, register, [ConflictingName, Pid1, SlaveNode]),
@@ -562,9 +561,8 @@ two_nodes_registration_race_condition_conflict_resolution_keep_more_recent_local
     Pid0 = syn_test_suite_helper:start_process(),
     Pid1 = syn_test_suite_helper:start_process(SlaveNode),
     %% inject into syn to simulate concurrent registration
-    SynRegistryByName0 = syn_backbone:get_ets(ConflictingName, syn_registry_by_name),
     ok = syn_registry:add_to_local_table(
-        ConflictingName, Pid0, node(), erlang:system_time() + 1000000000, undefined, SynRegistryByName0
+        ConflictingName, Pid0, node(), erlang:system_time() + 1000000000, undefined
     ),
     %% register on slave node to trigger conflict resolution on master node
     ok = rpc:call(SlaveNode, syn, register, [ConflictingName, Pid1, SlaveNode]),
@@ -620,7 +618,7 @@ two_nodes_registration_race_condition_conflict_resolution_keep_local_with_custom
     Pid1 = syn_test_suite_helper:start_process(SlaveNode),
     %% inject into syn to simulate concurrent registration with something more recent (which would be picked without a custom handler)
     SynRegistryByName0 = syn_backbone:get_ets(ConflictingName, syn_registry_by_name),
-    ok = syn_registry:add_to_local_table(ConflictingName, Pid0, keep_this_one, undefined, erlang:system_time() + 1000000000, SynRegistryByName0),
+    ok = syn_registry:add_to_local_table(ConflictingName, Pid0, keep_this_one, undefined, erlang:system_time() + 1000000000),
     %% register on slave node to trigger conflict resolution on master node
     ok = rpc:call(SlaveNode, syn, register, [ConflictingName, Pid1, SlaveNode]),
     timer:sleep(1000),
@@ -648,8 +646,7 @@ two_nodes_registration_race_condition_conflict_resolution_when_process_died(Conf
     Pid0 = syn_test_suite_helper:start_process(),
     Pid1 = syn_test_suite_helper:start_process(SlaveNode),
     %% inject into syn to simulate concurrent registration
-    SynRegistryByName0 = syn_backbone:get_ets(ConflictingName, syn_registry_by_name),
-    syn_registry:add_to_local_table(ConflictingName, Pid0, keep_this_one, 0, undefined, SynRegistryByName0),
+    syn_registry:add_to_local_table(ConflictingName, Pid0, keep_this_one, 0, undefined),
     timer:sleep(250),
     %% kill process
     syn_test_suite_helper:kill_process(Pid0),
@@ -1090,13 +1087,11 @@ three_nodes_anti_entropy(Config) ->
     timer:sleep(100),
     %% inject data to simulate latent conflicts
     Pid0 = "pid0", Conflict = "conflict",
-    SynRegistryByName0 = syn_backbone:get_ets(Pid0, syn_registry_by_name),
-    ok = syn_registry:add_to_local_table(Pid0, Pid0, node(), 0, undefined, SynRegistryByName0),
-    SynRegistryByName1 = syn_backbone:get_ets(Conflict, syn_registry_by_name),
-    ok = syn_registry:add_to_local_table(Pid0, Pid0, node(), 0, undefined, SynRegistryByName0),
+    ok = syn_registry:add_to_local_table(Pid0, Pid0, node(), 0, undefined),
+    ok = syn_registry:add_to_local_table(Pid0, Pid0, node(), 0, undefined),
     ok = rpc:call(SlaveNode1, syn_registry, add_to_local_table, ["pid1", Pid1, SlaveNode1, 0, undefined]),
     ok = rpc:call(SlaveNode2, syn_registry, add_to_local_table, ["pid2", Pid2, SlaveNode2, 0, undefined]),
-    ok = syn_registry:add_to_local_table("conflict", Pid0Conflict, node(), erlang:system_time() + 1000000000, undefined, SynRegistryByName1),
+    ok = syn_registry:add_to_local_table("conflict", Pid0Conflict, node(), erlang:system_time() + 1000000000, undefined),
     ok = rpc:call(SlaveNode1, syn_registry, add_to_local_table, ["conflict", Pid1Conflict, keep_this_one, erlang:system_time(), undefined]),
     ok = rpc:call(SlaveNode2, syn_registry, add_to_local_table, ["conflict", Pid2Conflict, SlaveNode2, erlang:system_time() + 1000000000, undefined]),
     %% wait to let anti-entropy settle
@@ -1137,16 +1132,11 @@ three_nodes_anti_entropy_manual(Config) ->
     Pid1Conflict = syn_test_suite_helper:start_process(SlaveNode1),
     Pid2Conflict = syn_test_suite_helper:start_process(SlaveNode2),
     timer:sleep(100),
-    Pid0 = "pid0", Conflict = "conflict",
-    SynRegistryByName0 = syn_backbone:get_ets(Pid0, syn_registry_by_name),
-    ok = syn_registry:add_to_local_table(Pid0, Pid0, node(), 0, undefined, SynRegistryByName0),
-    SynRegistryByName1 = syn_backbone:get_ets(Conflict, syn_registry_by_name),
-    ok = syn_registry:add_to_local_table(Pid0, Pid0, node(), 0, undefined, SynRegistryByName0),
     %% inject data to simulate latent conflicts
-    ok = syn_registry:add_to_local_table("pid0", Pid0, node(), 0, undefined, SynRegistryByName0),
+    ok = syn_registry:add_to_local_table("pid0", Pid0, node(), 0, undefined),
     ok = rpc:call(SlaveNode1, syn_registry, add_to_local_table, ["pid1", Pid1, SlaveNode1, 0, undefined]),
     ok = rpc:call(SlaveNode2, syn_registry, add_to_local_table, ["pid2", Pid2, SlaveNode2, 0, undefined]),
-    ok = syn_registry:add_to_local_table("conflict", Pid0Conflict, node(), erlang:system_time() + 1000000000, undefined, SynRegistryByName1),
+    ok = syn_registry:add_to_local_table("conflict", Pid0Conflict, node(), erlang:system_time() + 1000000000, undefined),
     ok = rpc:call(SlaveNode1, syn_registry, add_to_local_table, ["conflict", Pid1Conflict, keep_this_one, erlang:system_time(), undefined]),
     ok = rpc:call(SlaveNode2, syn_registry, add_to_local_table, ["conflict", Pid2Conflict, SlaveNode2, erlang:system_time() + 1000000000, undefined]),
     %% call anti entropy

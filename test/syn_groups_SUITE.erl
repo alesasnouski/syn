@@ -1231,14 +1231,11 @@ three_nodes_anti_entropy(Config) ->
     timer:sleep(100),
     %% inject data to simulate latent conflicts
     GroupName0 = "my-group",
-    SynGroupsByName0 = syn_backbone:get_ets(GroupName0, syn_groups_by_name),
     GroupName1 = "my-group-isolated",
-    SynGroupsByName1 = syn_backbone:get_ets(GroupName1, syn_groups_by_name),
-    ok = syn_groups:add_to_local_table(GroupName0, Pid0, node(), undefined, SynGroupsByName0),
-
-    ok = rpc:call(SlaveNode1, syn_groups, add_to_local_table, [GroupName0, Pid1, SlaveNode1, undefined, SynGroupsByName0]),
-    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, [GroupName0, Pid2, SlaveNode2, undefined, SynGroupsByName0]),
-    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, [GroupName1, Pid2Isolated, SlaveNode2, undefined, SynGroupsByName1]),
+    ok = syn_groups:add_to_local_table(GroupName0, Pid0, node(), undefined),
+    ok = rpc:call(SlaveNode1, syn_groups, add_to_local_table, [GroupName0, Pid1, SlaveNode1, undefined]),
+    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, [GroupName0, Pid2, SlaveNode2, undefined]),
+    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, [GroupName1, Pid2Isolated, SlaveNode2, undefined]),
     timer:sleep(5000),
     %% check
     Members = lists:sort([
@@ -1270,13 +1267,11 @@ three_nodes_anti_entropy_manual(Config) ->
     timer:sleep(100),
     %% inject data to simulate latent conflicts
     GroupName0 = "my-group",
-    SynGroupsByName0 = syn_backbone:get_ets(GroupName0, syn_groups_by_name),
     GroupName1 = "my-group-isolated",
-    SynGroupsByName1 = syn_backbone:get_ets(GroupName1, syn_groups_by_name),
-    ok = syn_groups:add_to_local_table("my-group", Pid0, node(), undefined, SynGroupsByName0),
-    ok = rpc:call(SlaveNode1, syn_groups, add_to_local_table, ["my-group", Pid1, SlaveNode1, undefined, SynGroupsByName0]),
-    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, ["my-group", Pid2, SlaveNode2, undefined, SynGroupsByName0]),
-    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, ["my-group-isolated", Pid2Isolated, SlaveNode2, undefined, SynGroupsByName1]),
+    ok = syn_groups:add_to_local_table("my-group", Pid0, node(), undefined),
+    ok = rpc:call(SlaveNode1, syn_groups, add_to_local_table, ["my-group", Pid1, SlaveNode1, undefined]),
+    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, ["my-group", Pid2, SlaveNode2, undefined]),
+    ok = rpc:call(SlaveNode2, syn_groups, add_to_local_table, ["my-group-isolated", Pid2Isolated, SlaveNode2, undefined]),
     %% call anti entropy
     ok = syn:force_cluster_sync(groups),
     timer:sleep(5000),

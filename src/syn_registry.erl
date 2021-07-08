@@ -39,7 +39,7 @@
 -export([sync_demonitor_and_kill_on_node/5]).
 -export([sync_get_local_registry_tuples/2]).
 -export([force_cluster_sync/0]).
--export([add_to_local_table/6, remove_from_local_table/3]).
+-export([add_to_local_table/5, add_to_local_table/6, remove_from_local_table/3]).
 -export([find_monitor_for_pid/1]).
 
 %% internal
@@ -632,6 +632,17 @@ add_to_local_table(Name, Pid, Meta, Time, MonitorRef, SynRegistryByName) ->
     ets:insert(SynRegistryByName, {{Name, Pid}, Meta, Time, MonitorRef, node(Pid)}),
     ets:insert(syn_registry_by_pid, {{Pid, Name}, Meta, Time, MonitorRef, node(Pid)}),
     ok.
+
+-spec add_to_local_table(
+    Name :: any(),
+    Pid :: pid(),
+    Meta :: any(),
+    Time :: integer(),
+    MonitorRef :: undefined | reference()
+) -> ok.
+add_to_local_table(Name, Pid, Meta, Time, MonitorRef) ->
+    SynRegistryByName = syn_backbone:get_ets(Name, syn_registry_by_name),
+    add_to_local_table(Name, Pid, Meta, Time, MonitorRef, SynRegistryByName).
 
 -spec remove_from_local_table(Name :: any(), Pid :: pid(), SynRegistryByName :: atom()) -> ok.
 remove_from_local_table(Name, Pid, SynRegistryByName) ->

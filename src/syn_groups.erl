@@ -51,7 +51,7 @@
 
 %% tests
 -ifdef(TEST).
--export([add_to_local_table/5]).
+-export([add_to_local_table/4, add_to_local_table/5]).
 -endif.
 
 %% gen_server callbacks
@@ -552,6 +552,16 @@ leave_on_node(GroupName, Pid, SynGroupsByName) ->
     SynGroupsByName :: atom()
 ) -> ok.
 add_to_local_table(GroupName, Pid, Meta, MonitorRef, SynGroupsByName) ->
+    ets:insert(SynGroupsByName, {{GroupName, Pid}, Meta, MonitorRef, node(Pid)}),
+    ets:insert(syn_groups_by_pid, {{Pid, GroupName}, Meta, MonitorRef, node(Pid)}),
+    ok.
+
+-spec add_to_local_table(
+    GroupName :: any(), Pid :: pid(), Meta :: any(),
+    MonitorRef :: undefined | reference()
+) -> ok.
+add_to_local_table(GroupName, Pid, Meta, MonitorRef) ->
+    SynGroupsByName = syn_backbone:get_ets(GroupName, syn_groups_by_name),
     ets:insert(SynGroupsByName, {{GroupName, Pid}, Meta, MonitorRef, node(Pid)}),
     ets:insert(syn_groups_by_pid, {{Pid, GroupName}, Meta, MonitorRef, node(Pid)}),
     ok.
